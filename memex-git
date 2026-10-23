@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+#
+# memex-git: memex adapter for the code role in git.
+#
+#   memex-git ADDR ROLE COMMAND [ARGUMENTS]
+#
+# README.md specifies the mapping. REPO is the working copy around the
+# current directory; ADDR is the URL one of its remotes fetches from.
+# Only fetch reaches the server, and it writes no local ref but
+# FETCH_HEAD. Nothing is pushed. Never prompts.
+#
+
+set -e
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+unsupported() {
+  echo "Not supported: $1" >&2
+  exit 2
+}
+
+usage() {
+  cat << EOF
+Usage: $0 ADDR code capabilities
+       $0 ADDR code workspaces
+       $0 ADDR code commits RANGE
+       $0 ADDR code versions VALUE
+       $0 ADDR code diff COMMIT
+       $0 ADDR code compare OLD NEW
+       $0 ADDR code base RANGE
+       $0 ADDR code fetch WHAT
+EOF
+}
+
+# A commit's fields for git log, ended by US, and the commit by RS;
+# trailers are separated by GS, a trailer's key from its value by FS
+FORMAT='%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cI%x1f%B%x1f'
+FORMAT+='%(trailers:only,unfold,separator=%x1d,key_value_separator=%x1c)'
+FORMAT+='%x1e'
+
+# A creation factor this high makes range-diff pair any two commits: for
+# a pair compare has already chosen
+PAIR_ANY=100000
+
+# A range-diff line that pairs two commits; BASH_REMATCH[1] is = or !
+PAIR_RE='^ *[0-9]+: +[0-9a-f]+ ([=!]) '
+
+# jq definitions shared by the commands
+JQ_DEFS='
+def record($kind; $id; $basis; $links; $data): {
+  id: $id, source: $addr, role: "code", kind: $kind,
+  basis: $basis, links: $links, data: $data, notes: {}
+};
+def at($where): .data.where = $where | .basis = ([.id] + $where | join(" "));
+def commit:
+  [.[7] | rtrimstr("\n") | split("\u001d")[] | select(. != "")
+    | split("\u001c") | [.[0], (.[1:] | join("\u001c"))]] as $trailers
+  | [$trailers[] | select(.[0] | ascii_downcase == "change-id")
+    | .[1]][0] as $change_id
+  | record("commit"; .[0]; .[0];
+      [["commit", .[0]]]
+        + if $change_id then [["change-id", $change_id]] else [] end;
+      {
+        commit: .[0],
+        identity: (if $change_id then ["commit", $change_id] else null end),
+        parents: (.[1] | split(" ") | map(select(. != ""))),
+        author: {name: .[2], email: .[3], me: (.[3] == $email)},
+        authored: .[4],
+        committed: .[5],
+        subject: (.[6] | split("\n")[0]),
+        message: .[6],
+        trailers: $trailers,
+        where: []
+      });
+def commits:
+  split("\u001e")[] | ltrimstr("\n") | select(. != "") | split("\u001f")
+  | commit;
+'
+
+# Sets REMOTE to the remote whose URL is ADDR
+need_remote() {
+  local key
+  local url
+  while read -r key url; do
+    if [ "$url" == "$ADDR" ]; then
+      key=${key#remote.}
+      REMOTE=${key%.url}
+      return
+    fi
+  done <<< "$(git config --get-regexp '^remote\..*\.url$')"
+  die "No remote of $REPO fetches from $ADDR"
+}
+
+# Prints the commit RECORDs of git log ARGUMENTS
+log_records() {
+  local log
+  log=$(git log --format="$FORMAT" "$@") || exit 1
+  jq -Rsc --arg addr "$ADDR" --arg email "$EMAIL" "$JQ_DEFS"'commits' \
+    <<< "$log"
+}
+
+# Prints the WORKSPACEs of REPO as JSON objects of path, head and branch
+worktrees() {
+  local list
+  list=$(git worktree list --porcelain) || exit 1
+  jq -Rsc 'split("\n\n")[]
+    | [split("\n")[] | select(. != "")
+      | capture("^(?<key>[^ ]+)( (?<value>.*))?$") | .value //= true]
+    | from_entries
+    | select(.HEAD and (.prunable | not))
+    | {path: .worktree, head: .HEAD,
+      branch: (if .branch then .branch | ltrimstr("refs/heads/")
+        else null end)}' <<< "$list"
+}
+
+workspaces() {
+  local worktree
+  local path
+  local branch
+  local upstream
+  local status
+  while read -r worktree; do
+    path=$(jq -r .path <<< "$worktree")
+    branch=$(jq -r '.branch // empty' <<< "$worktree")
+    upstream=
+    [ -n "$branch" ] && upstream=$(git for-each-ref \
+      --format='%(upstream:short)' "refs/heads/$branch")
+    # Optional locks would collide with git run by the user meanwhile
+    status=$(git -C "$path" --no-optional-locks status --porcelain \
+      --untracked-files=no) || exit 1
+    jq -c --arg addr "$ADDR" --arg upstream "$upstream" \
+      --argjson changed "$([ -n "$status" ] && echo true || echo false)" \
+      "$JQ_DEFS"'
+      (if $upstream == "" then null else $upstream end) as $upstream
+      | record("workspace"; .path;
+          "\(.head) \(.branch) \($upstream) \($changed)";
+          [["commit", .head]];
+          {path, branch, head, upstream: $upstream, changed: $changed})' \
+      <<< "$worktree"
+  done <<< "$(worktrees)"
+}
+
+# Prints where COMMIT is as a JSON list: the WORKSPACEs whose HEAD has it,
+# then the local branches and the branches of REMOTE that have it
+where() {
+  local worktrees
+  local refs
+  local path
+  local head
+  worktrees=$(worktrees)
+  refs=$(git for-each-ref --contains "$1" \
+    --format='%(if)%(symref)%(then)%(else)%(refname:short)%(end)' \
+    refs/heads "refs/remotes/$REMOTE") || exit 1
+  {
+    jq -r '[.path, .head] | @tsv' <<< "$worktrees" |
+      while IFS=$'\t' read -r path head; do
+        git merge-base --is-ancestor "$1" "$head" &&
+          echo "$path"
+      done
+    echo "$refs"
+  } | jq -Rsc 'split("\n") | map(select(. != ""))'
+}
+
+# Prints RECORDs with where each is
+locate_all() {
+  local record
+  while read -r record; do
+    [ -n "$record" ] || continue
+    jq -c --argjson where "$(where "$(jq -r .id <<< "$record")")" \
+      "$JQ_DEFS"'at($where)' <<< "$record"
+  done
+}
+
+commits() {
+  log_records "$1" --
+}
+
+versions() {
+  local heads
+  local records
+  heads=($(worktrees | jq -r .head))
+  records=$(log_records --fixed-strings --grep="$1" "${heads[@]}" \
+    --branches --remotes="$REMOTE" --) || exit 1
+  jq -c --arg value "$1" 'select(.data.identity[1] == $value)' \
+    <<< "$records" | locate_all
+}
+
+diff() {
+  local commit
+  local old
+  local status
+  local path
+  local old_path
+  local paths
+  local patch
+  commit=$(git rev-parse -q --verify "$1^{commit}") || die "No commit $1"
+  # The first parent, or the empty tree for a root commit
+  old=$(git rev-parse -q --verify "$commit^") ||
+    old=$(git hash-object -t tree /dev/null)
+  while IFS= read -r -d '' status; do
+    IFS= read -r -d '' path
+    old_path=
+    if [[ "$status" == R* ]]; then
+      old_path=$path
+      IFS= read -r -d '' path
+    fi
+    # Rename detection needs both paths
+    paths=("$path")
+    [ -n "$old_path" ] && paths+=("$old_path")
+    patch=$(git --literal-pathspecs diff-tree -p -M --no-color "$old" \
+      "$commit" -- "${paths[@]}") || exit 1
+    jq -Rsc --arg addr "$ADDR" --arg commit "$commit" --arg path "$path" \
+      --arg old_path "$old_path" --arg status "$status" "$JQ_DEFS"'
+      record("file"; "\($commit):\($path)"; $commit; [["commit", $commit]];
+        {
+          commit: $commit,
+          path: $path,
+          old_path: (if $old_path == "" then null else $old_path end),
+          status: ({A: "added", D: "deleted", R: "renamed"}[$status[:1]]
+            // "modified"),
+          patch: .
+        })' <<< "$patch"
+  done < <(git diff-tree -r -M -z --name-status "$old" "$commit")
+}
+
+# Prints the commits of RANGE, base to tip, as JSON objects of commit and
+# change_id
+series() {
+  local log
+  log=$(git log --no-merges --reverse --format="$FORMAT" "$1" --) ||
+    exit 1
+  jq -Rsc --arg addr "$ADDR" --arg email "$EMAIL" "$JQ_DEFS"'
+    [commits | {commit: .id, change_id: .data.identity[1]}]' <<< "$log"
+}
+
+# Prints the pair RECORD of OLD and NEW, either being - when absent, with
+# CHANGE_ID, or - when none
+pair() {
+  local status
+  local patch
+  local diff
+  if [ "$1" == - ]; then
+    status=added
+  elif [ "$2" == - ]; then
+    status=removed
+  elif [ "$1" == "$2" ]; then
+    status=same
+  else
+    diff=$(git range-diff --no-color --creation-factor=$PAIR_ANY \
+      "$1^!" "$2^!") || exit 1
+    [[ "$(head -1 <<< "$diff")" =~ $PAIR_RE ]] ||
+      die "Cannot compare $1 with $2"
+    status=same
+    if [ "${BASH_REMATCH[1]}" == '!' ]; then
+      status=changed
+      patch=$(tail -n +2 <<< "$diff" | sed 's/^    //')
+    fi
+  fi
+  jq -Rsc --arg addr "$ADDR" --arg old "$1" --arg new "$2" \
+    --arg change_id "$3" --arg status "$status" "$JQ_DEFS"'
+    (if $status == "changed" then . else null end) as $patch
+    | def side: if . == "-" then null else . end;
+    record("pair"; "\($old)..\($new)"; "\($old)..\($new)";
+      [$old, $new | select(. != "-") | ["commit", .]]
+        + if $change_id == "-" then [] else [["change-id", $change_id]] end;
+      {old: ($old | side), new: ($new | side), status: $status,
+        patch: $patch})' <<< "$patch"
+}
+
+# Pairs the commits of OLD and NEW by Change-Id, then the rest as
+# range-diff does; prints the pairs in NEW's order, then what NEW dropped
+compare() {
+  local olds
+  local news
+  local matches
+  local old
+  local new
+  local change_id
+  local pairs
+  matches=$(git range-diff --no-color "$1" "$2") || exit 1
+  olds=$(series "$1") || exit 1
+  news=$(series "$2") || exit 1
+  pairs=$(jq -nr --argjson olds "$olds" --argjson news "$news" \
+    --arg matches "$matches" '
+    def full($list): . as $abbrev
+      | [$list[].commit | select(startswith($abbrev))][0];
+    [$olds[] | select(.change_id) | {key: .change_id, value: .commit}]
+      | from_entries as $old_by_id
+    | [$news[] | select(.change_id and $old_by_id[.change_id])
+      | {key: .commit, value: $old_by_id[.change_id]}] as $by_id
+    | ($by_id | map(.key, .value)) as $taken
+    | [$matches | split("\n")[]
+      | capture("^ *[0-9]+: +(?<old>[0-9a-f]+) [=!] "
+        + " *[0-9]+: +(?<new>[0-9a-f]+) ")
+      | {key: (.new | full($news)), value: (.old | full($olds))}
+      | select(.key as $new | .value as $old
+        | $taken | index([$new]) or index([$old]) | not)] as $by_diff
+    | ($by_id + $by_diff | from_entries) as $old_of
+    | ($old_of | to_entries | map(.value)) as $paired
+    | ($olds | map({key: .commit, value: .change_id}) | from_entries)
+      as $old_ids
+    | ($news[] | [$old_of[.commit] // "-", .commit,
+        .change_id // $old_ids[$old_of[.commit] // ""] // "-"]),
+      ($olds[] | select(.commit as $c | $paired | index([$c]) | not)
+        | [.commit, "-", .change_id // "-"])
+    | @tsv') || exit 1
+  while IFS=$'\t' read -r old new change_id; do
+    [ -n "$old" ] || continue
+    pair "$old" "$new" "$change_id"
+  done <<< "$pairs"
+}
+
+base() {
+  local revs
+  local commit
+  revs=$(git rev-parse --revs-only "$1") || exit 1
+  revs=($(tr -d '^' <<< "$revs"))
+  [ ${#revs[@]} -gt 0 ] || die "No commit $1"
+  if [ ${#revs[@]} -eq 1 ]; then
+    revs+=($(git rev-parse -q --verify "refs/remotes/$REMOTE/HEAD")) ||
+      die "$REMOTE/HEAD is not set: run git remote set-head $REMOTE --auto"
+  fi
+  commit=$(git merge-base --octopus "${revs[@]}") || die "$1 has no base"
+  log_records -1 "$commit" -- | locate_all
+}
+
+fetch() {
+  local ssh
+  local commit
+  # FETCH_HEAD is the only ref fetch may write
+  [[ "$1" != *:* ]] || die "Not a ref to fetch: $1"
+  ssh=${GIT_SSH_COMMAND:-$(git config core.sshCommand || echo ssh)}
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh -o BatchMode=yes" \
+    git fetch -q --no-tags "$REMOTE" "$1" || die "Cannot fetch $1 from $ADDR"
+  commit=$(git rev-parse -q --verify 'FETCH_HEAD^{commit}') ||
+    die "$1 is not a commit"
+  log_records -1 "$commit" -- |
+    jq -c --arg addr "$ADDR" "$JQ_DEFS"'at([$addr])'
+}
+
+if [ "$1" == "-h" -o "$1" == "--help" ]; then
+  usage
+  exit 0
+fi
+[ $# -ge 3 ] || die "$(usage)"
+if [ "$2" != code ]; then
+  echo "Not a $2 adapter" >&2
+  exit 2
+fi
+# Drop ROLE: the commands below take ADDR COMMAND [ARGUMENTS]
+set -- "$1" "${@:3}"
+ADDR=$1
+
+case "$2" in
+  capabilities)
+    echo '{"local": true, "remote": true, "exact": false}'
+    exit 0
+    ;;
+  workspaces)
+    [ $# -eq 2 ] || die "$(usage)"
+    ;;
+  commits | versions | diff | base | fetch)
+    [ $# -eq 3 ] || die "$(usage)"
+    ;;
+  compare)
+    [ $# -eq 4 ] || die "$(usage)"
+    ;;
+  *)
+    unsupported "$2"
+    ;;
+esac
+# Git would read an argument starting with - as an option
+for arg in "${@:3}"; do
+  [[ "$arg" != -* ]] || die "Not a revision or value: $arg"
+done
+REPO=$(git rev-parse --show-toplevel) || die "Not in a git working copy"
+# Pathspecs and the paths git prints are relative to the top
+cd "$REPO"
+EMAIL=$(git config user.email) || true
+case "$2" in
+  versions | base | fetch)
+    need_remote
+    ;;
+esac
+"$2" "${@:3}"
