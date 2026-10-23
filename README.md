@@ -91,4 +91,4 @@ then the commits NEW dropped. Merges are skipped, as range-diff does.
 scratch directory; they need jq and git, and no network.
 
 [memex]: https://github.com/roolebo/memex
-[code.md]: https://github.com/roolebo/memex/blob/main/code.md
+[code.md]: https://github.com/roolebo/memex/blob/main/skills/memex/code.md
