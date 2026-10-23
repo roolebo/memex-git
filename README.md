@@ -85,5 +85,10 @@ then the commits NEW dropped. Merges are skipped, as range-diff does.
   branches?
 - Match ADDR after `url.*.insteadOf` rewrites?
 
+## Tests
+
+`test/run [TEST...]` runs the tests against repositories it builds in a
+scratch directory; they need jq and git, and no network.
+
 [memex]: https://github.com/roolebo/memex
 [code.md]: https://github.com/roolebo/memex/blob/main/code.md

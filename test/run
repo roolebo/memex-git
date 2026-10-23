@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+#
+# test/run: tests of memex-git against git repositories it builds.
+#
+# Each test gets a bare repository as the server, at a file:// ADDR, and
+# a clone of it with a second worktree. No test reaches a network. HOME
+# is a scratch directory and no global or system git config is read.
+#
+
+set -e
+
+CURDIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+ROOT=$(dirname "$CURDIR")
+ADAPTER=$ROOT/memex-git
+DIR=$(realpath "$(mktemp -d)")
+FAILED=0
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat << EOF
+Usage: $0 [TEST...]
+
+Runs the given tests, or all of them:
+$(declare -F | cut -d' ' -f3 | grep '^test_' | sed 's/^/  /')
+EOF
+}
+
+cleanup() {
+  rm -rf "$DIR"
+}
+
+# Commit in the current directory with MESSAGE, one second after the
+# commit before; prints nothing
+commit() {
+  TICK=$((TICK + 1))
+  GIT_AUTHOR_DATE="@$TICK +0200" GIT_COMMITTER_DATE="@$TICK +0200" \
+    git commit -q -m "$1" "${@:2}"
+}
+
+# Like commit, for git cherry-pick of COMMIT
+pick() {
+  TICK=$((TICK + 1))
+  GIT_COMMITTER_DATE="@$TICK +0200" git cherry-pick "$1" > /dev/null
+}
+
+# Sets C1..C5 and NAME to commits; see the comments below
+make_repos() {
+  local seed=$TEST_DIR/seed
+  git init -q --bare -b main "$TEST_DIR/server.git"
+  git init -q -b main "$seed"
+  cd "$seed"
+  git config user.name "Alice Author"
+  git config user.email alice@example.org
+  printf 'a\n' > a
+  seq 1 30 > b
+  printf 'd\n' > d
+  git add a b d
+  commit "Add a, b and d"
+  BASE=$(git rev-parse HEAD)
+  git push -q "$ADDR" main
+  # Patch set 1 of change 1, on the server only
+  printf 'nine\n' > nine
+  git add nine
+  commit "Add nine" -m "Change-Id: I9"
+  C9=$(git rev-parse HEAD)
+  git push -q "$ADDR" HEAD:refs/changes/01/1/1
+
+  git clone -q "$ADDR" "$TEST_DIR/work"
+  cd "$TEST_DIR/work"
+  git config user.name "Bob Builder"
+  git config user.email bob@example.org
+  # topic is version 1 of the series
+  git checkout -q -b topic --track origin/main
+  printf 'a1\n' > a
+  commit "Change a" -m "Change-Id: I1" -a
+  C1=$(git rev-parse HEAD)
+  printf 'two\n' > two
+  git add two
+  commit "Add two" -m "Change-Id: I2"
+  C2=$(git rev-parse HEAD)
+  git rm -q d
+  commit "Remove d" -m "Change-Id: I3"
+  C3=$(git rev-parse HEAD)
+  git mv b b2
+  commit "Rename b"
+  C4=$(git rev-parse HEAD)
+  # v2 keeps C1, rewrites C2 entirely, drops C3, keeps C4 and adds C5
+  git worktree add -q -b v2 "$TEST_DIR/wt2" origin/main
+  cd "$TEST_DIR/wt2"
+  pick "$C1"
+  NEW1=$(git rev-parse HEAD)
+  printf 'TWO\n' > TWO
+  git add TWO
+  commit "Add TWO instead" -m "Change-Id: I2"
+  NEW2=$(git rev-parse HEAD)
+  pick "$C4"
+  NEW4=$(git rev-parse HEAD)
+  printf 'five\n' > five
+  git add five
+  commit "Add five" -m "Change-Id: I5"
+  NEW5=$(git rev-parse HEAD)
+  printf 'dirty\n' > a
+  # The server got C1 on release
+  cd "$TEST_DIR/work"
+  git push -q origin "$C1:refs/heads/release"
+  git fetch -q origin
+}
+
+# Run the adapter on ADDR with ARGS in the working copy; sets OUT, ERR
+# and STATUS
+call() {
+  OUT=$(cd "$TEST_DIR/work" && "$ADAPTER" "$ADDR" "$@" 2> "$TEST_DIR/err") &&
+    STATUS=0 || STATUS=$?
+  ERR=$(< "$TEST_DIR/err")
+}
+
+# Apply a jq FILTER to OUT, one record at a time, or to all with -s
+q() {
+  jq -c "$@" <<< "$OUT"
+}
+
+# JSON in one line, as jq -c prints it
+json() {
+  jq -c . <<< "$1"
+}
+
+check() {
+  [ "$2" == "$3" ] && return
+  echo "# $TEST: $1: expected '$3', got '$2'"
+  FAILED=$((FAILED + 1))
+}
+
+check_has() {
+  [[ "$2" == *"$3"* ]] && return
+  echo "# $TEST: $1: '$2' lacks '$3'"
+  FAILED=$((FAILED + 1))
+}
+
+test_capabilities() {
+  call code capabilities
+  check status "$STATUS" 0
+  check caps "$(q .)" '{"local":true,"remote":true,"exact":false}'
+}
+
+test_not_code() {
+  call discussion capabilities
+  check discussion "$STATUS" 2
+  call tracker issue 1
+  check tracker "$STATUS" 2
+}
+
+test_bad_usage() {
+  call code frobnicate 1
+  check command "$STATUS" 2
+  call code commits
+  check "no range" "$STATUS" 1
+  call code compare HEAD
+  check "one range" "$STATUS" 1
+  call code commits --all
+  check option "$STATUS" 1
+  check_has message "$ERR" "Not a revision or value: --all"
+  OUT=$(cd "$TEST_DIR" && "$ADAPTER" "$ADDR" code commits HEAD 2>&1) &&
+    STATUS=0 || STATUS=$?
+  check "no repo" "$STATUS" 1
+  check_has message "$OUT" "Not in a git working copy"
+}
+
+test_workspaces() {
+  make_repos
+  call code workspaces
+  check status "$STATUS" 0
+  check records "$(q -s length)" 2
+  check first "$(q -s '.[0] | [.id, .source, .role, .kind, .notes]')" \
+    "$(json "[\"$TEST_DIR/work\", \"$ADDR\", \"code\", \"workspace\", {}]")"
+  check work "$(q -s .[0].data)" "$(json "{\"path\": \"$TEST_DIR/work\",
+    \"branch\": \"topic\", \"head\": \"$C4\", \"upstream\": \"origin/main\",
+    \"changed\": false}")"
+  check wt2 "$(q -s .[1].data)" "$(json "{\"path\": \"$TEST_DIR/wt2\",
+    \"branch\": \"v2\", \"head\": \"$NEW5\", \"upstream\": \"origin/main\",
+    \"changed\": true}")"
+  check links "$(q -s .[0].links)" "[[\"commit\",\"$C4\"]]"
+}
+
+# Untracked files are no change
+test_workspaces_untracked() {
+  make_repos
+  printf 'x\n' > "$TEST_DIR/work/untracked"
+  git -C "$TEST_DIR/work" checkout -q --detach
+  call code workspaces
+  check changed "$(q -s .[0].data.changed)" false
+  check detached "$(q -s .[0].data.branch)" null
+  check upstream "$(q -s .[0].data.upstream)" null
+}
+
+test_commits() {
+  make_repos
+  call code commits origin/main..topic
+  check status "$STATUS" 0
+  check commits "$(q -s 'map(.id)')" \
+    "$(json "[\"$C4\", \"$C3\", \"$C2\", \"$C1\"]")"
+  check envelope "$(q -s '.[1] | [.source, .role, .kind, .basis, .notes]')" \
+    "$(json "[\"$ADDR\", \"code\", \"commit\", \"$C3\", {}]")"
+  check links "$(q -s .[1].links)" \
+    "[[\"commit\",\"$C3\"],[\"change-id\",\"I3\"]]"
+  check data "$(q -s '.[1].data | del(.message, .trailers, .where)')" \
+    "$(json "{\"commit\": \"$C3\", \"identity\": [\"commit\", \"I3\"],
+    \"parents\": [\"$C2\"], \"author\": {\"name\": \"Bob Builder\",
+      \"email\": \"bob@example.org\", \"me\": true},
+    \"authored\": \"1970-01-01T02:00:05+02:00\",
+    \"committed\": \"1970-01-01T02:00:05+02:00\",
+    \"subject\": \"Remove d\"}")"
+  check message "$(q -s .[1].data.message)" '"Remove d\n\nChange-Id: I3\n"'
+  check trailers "$(q -s .[1].data.trailers)" '[["Change-Id","I3"]]'
+  check where "$(q -s .[1].data.where)" '[]'
+  check "no identity" "$(q -s '.[0].data | [.identity, .trailers]')" \
+    '[null,[]]'
+  check "no change-id" "$(q -s .[0].links)" "[[\"commit\",\"$C4\"]]"
+}
+
+test_commits_bad_range() {
+  make_repos
+  call code commits nosuch..topic
+  check status "$STATUS" 1
+  check out "$OUT" ""
+  check_has stderr "$ERR" "nosuch"
+}
+
+test_versions() {
+  make_repos
+  call code versions I1
+  check status "$STATUS" 0
+  check commits "$(q -s 'map(.id) | sort')" \
+    "$(jq -nc --arg a "$C1" --arg b "$NEW1" '[$a, $b] | sort')"
+  check where "$(q -c 'select(.id == "'"$C1"'") | .data.where')" \
+    "$(json "[\"$TEST_DIR/work\", \"topic\", \"origin/release\"]")"
+  check where2 "$(q -c 'select(.id == "'"$NEW1"'") | .data.where')" \
+    "$(json "[\"$TEST_DIR/wt2\", \"v2\"]")"
+  check basis "$(q -r 'select(.id == "'"$NEW1"'") | .basis')" \
+    "$NEW1 $TEST_DIR/wt2 v2"
+}
+
+# A Change-Id mentioned in a message but not its trailer is no version
+test_versions_trailer_only() {
+  make_repos
+  cd "$TEST_DIR/work"
+  commit "Mention I5" --allow-empty
+  call code versions I5
+  check commits "$(q -s 'map(.id)')" "[\"$NEW5\"]"
+}
+
+test_versions_none() {
+  make_repos
+  call code versions Inone
+  check status "$STATUS" 0
+  check out "$OUT" ""
+}
+
+test_versions_no_remote() {
+  make_repos
+  OUT=$(cd "$TEST_DIR/work" &&
+    "$ADAPTER" file:///elsewhere code versions I1 2>&1) &&
+    STATUS=0 || STATUS=$?
+  check status "$STATUS" 1
+  check_has message "$OUT" "No remote of $TEST_DIR/work fetches from"
+}
+
+test_diff() {
+  make_repos
+  call code diff "$C4"
+  check status "$STATUS" 0
+  check records "$(q -s length)" 1
+  check envelope "$(q '[.id, .kind, .basis, .links]')" \
+    "$(json "[\"$C4:b2\", \"file\", \"$C4\", [[\"commit\", \"$C4\"]]]")"
+  check renamed "$(q '.data | [.commit, .path, .old_path, .status]')" \
+    "$(json "[\"$C4\", \"b2\", \"b\", \"renamed\"]")"
+  check_has patch "$(q -r .data.patch)" "rename from b"
+}
+
+test_diff_statuses() {
+  make_repos
+  call code diff "$C1"
+  check modified "$(q '.data | [.path, .old_path, .status]')" \
+    '["a",null,"modified"]'
+  check_has patch "$(q -r .data.patch)" "+a1"
+  call code diff "$C2"
+  check added "$(q '.data | [.path, .status]')" '["two","added"]'
+  call code diff "$C3"
+  check deleted "$(q '.data | [.path, .status]')" '["d","deleted"]'
+  check_has patch "$(q -r .data.patch)" "-d"
+}
+
+# A root commit adds every file; the paths are relative to the top
+test_diff_root() {
+  make_repos
+  OUT=$(cd "$TEST_DIR/wt2" && mkdir -p sub && cd sub &&
+    "$ADAPTER" "$ADDR" code diff "$BASE")
+  check paths "$(q -s 'map([.data.path, .data.status])')" \
+    '[["a","added"],["b","added"],["d","added"]]'
+}
+
+test_diff_bad_commit() {
+  make_repos
+  call code diff nosuch
+  check status "$STATUS" 1
+  check_has stderr "$ERR" "No commit nosuch"
+}
+
+test_compare() {
+  make_repos
+  call code compare origin/main..topic origin/main..v2
+  check status "$STATUS" 0
+  check pairs "$(q -s 'map([.data.old, .data.new, .data.status])')" \
+    "$(json "[[\"$C1\", \"$NEW1\", \"same\"], [\"$C2\", \"$NEW2\", \"changed\"],
+      [\"$C4\", \"$NEW4\", \"same\"], [null, \"$NEW5\", \"added\"],
+      [\"$C3\", null, \"removed\"]]")"
+  check envelope "$(q -s '.[1] | [.id, .basis, .kind, .role]')" \
+    "$(json "[\"$C2..$NEW2\", \"$C2..$NEW2\", \"pair\", \"code\"]")"
+  check links "$(q -s .[1].links)" "$(json "[[\"commit\", \"$C2\"],
+    [\"commit\", \"$NEW2\"], [\"change-id\", \"I2\"]]")"
+  check "links added" "$(q -s .[3].links)" \
+    "[[\"commit\",\"$NEW5\"],[\"change-id\",\"I5\"]]"
+  check "links removed" "$(q -s .[4].links)" \
+    "[[\"commit\",\"$C3\"],[\"change-id\",\"I3\"]]"
+  check "no patch" "$(q -s '[.[0, 2, 3, 4].data.patch]')" \
+    '[null,null,null,null]'
+  check_has patch "$(q -s -r .[1].data.patch)" "## TWO (new) ##"
+  check_has "patch message" "$(q -s -r .[1].data.patch)" \
+    "+    Add TWO instead"
+}
+
+test_compare_bad_range() {
+  make_repos
+  call code compare origin/main..topic nosuch..v2
+  check status "$STATUS" 1
+  check out "$OUT" ""
+}
+
+test_base() {
+  make_repos
+  call code base origin/main..topic
+  check status "$STATUS" 0
+  check commit "$(q -r .id)" "$BASE"
+  check where "$(q -c '.data.where | sort')" "$(json "[\"$TEST_DIR/work\",
+    \"$TEST_DIR/wt2\", \"main\", \"origin/main\", \"origin/release\",
+    \"topic\", \"v2\"]" | jq -c sort)"
+}
+
+# A single commit forks from the remote's HEAD
+test_base_upstream() {
+  make_repos
+  call code base v2
+  check status "$STATUS" 0
+  check commit "$(q -r .id)" "$BASE"
+  git -C "$TEST_DIR/work" remote set-head origin -d
+  call code base v2
+  check unset "$STATUS" 1
+  check_has message "$ERR" "origin/HEAD is not set"
+}
+
+test_fetch() {
+  make_repos
+  call code fetch refs/changes/01/1/1
+  check status "$STATUS" 0
+  check commit "$(q '[.id, .data.identity, .data.where]')" \
+    "$(json "[\"$C9\", [\"commit\", \"I9\"], [\"$ADDR\"]]")"
+  check "author not me" "$(q .data.author.me)" false
+  check refs "$(git -C "$TEST_DIR/work" for-each-ref --contains "$C9")" ""
+}
+
+test_fetch_refspec() {
+  make_repos
+  call code fetch refs/changes/01/1/1:refs/heads/x
+  check status "$STATUS" 1
+  check_has message "$ERR" "Not a ref to fetch"
+  check ref "$(git -C "$TEST_DIR/work" rev-parse -q --verify x || true)" ""
+}
+
+test_fetch_missing() {
+  make_repos
+  call code fetch refs/changes/02/2/1
+  check status "$STATUS" 1
+  check_has message "$ERR" "Cannot fetch refs/changes/02/2/1 from $ADDR"
+}
+
+run() {
+  local failed=$FAILED
+  TEST=$1
+  TEST_DIR=$DIR/$1
+  ADDR=file://$TEST_DIR/server.git
+  TICK=0
+  mkdir -p "$TEST_DIR/work" "$TEST_DIR/home"
+  export HOME=$TEST_DIR/home
+  cd "$DIR"
+  "$1" < /dev/null
+  if [ $FAILED -eq $failed ]; then
+    echo "ok $1"
+  else
+    echo "not ok $1"
+  fi
+}
+
+if [ "$1" == "-h" -o "$1" == "--help" ]; then
+  usage
+  exit 0
+fi
+command -v jq > /dev/null || die "jq is not installed"
+command -v git > /dev/null || die "git is not installed"
+trap cleanup EXIT
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_SSH_COMMAND
+# The scratch directory is no repository unless a test makes it one
+export GIT_CEILING_DIRECTORIES=$DIR
+
+TESTS=("$@")
+[ $# -gt 0 ] || TESTS=($(declare -F | cut -d' ' -f3 | grep '^test_'))
+for test in "${TESTS[@]}"; do
+  declare -F "$test" > /dev/null || die "No such test: $test"
+  run "$test"
+done
+[ $FAILED -eq 0 ] || die "$FAILED failed"
